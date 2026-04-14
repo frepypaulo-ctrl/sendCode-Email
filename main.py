@@ -5,7 +5,7 @@ import random
 from email.message import EmailMessage
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Dicionário temporário para guardar os códigos: { "email@teste.com": "123456" }
 codigos_gerados = {}
