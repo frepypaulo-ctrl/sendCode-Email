@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import secrets
 import smtplib
 import logging
@@ -13,14 +12,12 @@ from flask_cors import CORS
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-# CORS aberto — necessário para ser chamado a partir de um app React Native
-# (que não envia origem tipo browser) e a partir de qualquer site em HTML.
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Habilita CORS globalmente para todas as rotas, origens, métodos e cabeçalhos
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dimako-api")
 
-# Credenciais SOMENTE via variável de ambiente — nunca hardcoded no código.
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 
@@ -30,19 +27,13 @@ if not EMAIL_USER or not EMAIL_PASS:
         "de ambiente (no dashboard do Render, em Environment)."
     )
 
-# Tempo de validade do código, em segundos (10 minutos)
 CODIGO_VALIDADE_SEGUNDOS = 10 * 60
-
-# Limite de pedidos de código por e-mail (janela deslizante simples)
 LIMITE_PEDIDOS = 3
 JANELA_LIMITE_SEGUNDOS = 15 * 60
 
 # ---------------------------------------------------------------------------
 # Armazenamento em memória
 # ---------------------------------------------------------------------------
-# ATENÇÃO: isto vive na memória do processo. Se o serviço no Render reiniciar,
-# escalar para mais de uma instância, ou fizer deploy, estes dados perdem-se.
-# Para produção séria com múltiplas instâncias, troque por Redis.
 codigos_gerados = {}   # email -> {"codigo": str, "expira_em": float}
 pedidos_por_email = {} # email -> [timestamps]
 
@@ -67,13 +58,13 @@ def registar_pedido(email):
 
 
 # ---------------------------------------------------------------------------
-# Middleware CORS (garante os headers em toda resposta, incl. erros)
+# Middleware CORS Adicional (Para garantir suporte total em file:// e Apps)
 # ---------------------------------------------------------------------------
 @app.after_request
 def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     return response
 
 
@@ -104,7 +95,6 @@ def enviar_email(destinatario, codigo):
 
 
 def gerar_codigo():
-    # secrets em vez de random: gerador criptograficamente seguro
     return "".join(secrets.choice("0123456789") for _ in range(6))
 
 
@@ -118,12 +108,10 @@ def rota_enviar():
 
     limpar_expirados()
 
-    dados = request.get_json(silent=True)
-    if not dados or 'email' not in dados:
-        return jsonify({"sucesso": False, "erro": "Email não fornecido"}), 400
-
+    dados = request.get_json(silent=True) or {}
     email = str(dados.get('email', '')).strip().lower()
-    if '@' not in email or '.' not in email:
+
+    if not email or '@' not in email or '.' not in email:
         return jsonify({"sucesso": False, "erro": "Email inválido"}), 400
 
     if excedeu_limite(email):
@@ -142,9 +130,9 @@ def rota_enviar():
     try:
         enviar_email(email, codigo)
     except Exception:
-        # Nunca devolver detalhes internos (str(e)) ao cliente.
         logger.exception("Falha ao enviar e-mail para %s", email)
-        del codigos_gerados[email]
+        if email in codigos_gerados:
+            del codigos_gerados[email]
         return jsonify({"sucesso": False, "erro": "Não foi possível enviar o e-mail. Tente novamente."}), 500
 
     return jsonify({"sucesso": True})
@@ -157,12 +145,12 @@ def rota_verificar():
 
     limpar_expirados()
 
-    dados = request.get_json(silent=True)
-    if not dados or 'email' not in dados or 'codigo' not in dados:
-        return jsonify({"validado": False, "erro": "Email ou código não fornecido"}), 400
-
+    dados = request.get_json(silent=True) or {}
     email = str(dados.get('email', '')).strip().lower()
     codigo_digitado = str(dados.get('codigo', '')).strip()
+
+    if not email or not codigo_digitado:
+        return jsonify({"validado": False, "erro": "Email ou código não fornecido"}), 400
 
     registo = codigos_gerados.get(email)
 
@@ -180,12 +168,11 @@ def rota_verificar():
     return jsonify({"validado": True})
 
 
-@app.route('/')
+@app.route('/', methods=['GET', 'OPTIONS'])
 def health():
     return jsonify({"api": "Dimako", "status": "running", "cors": "enabled_all"}), 200
 
 
 if __name__ == "__main__":
-    # Render exige que a porta seja dinâmica
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
