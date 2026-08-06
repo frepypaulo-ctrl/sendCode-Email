@@ -3,17 +3,14 @@ import time
 import secrets
 import smtplib
 import logging
+import threading
 from email.message import EmailMessage
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ---------------------------------------------------------------------------
-# Configuração básica
-# ---------------------------------------------------------------------------
 app = Flask(__name__)
-
-# Habilita CORS globalmente para todas as rotas, origens, métodos e cabeçalhos
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+# Habilita CORS global
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dimako-api")
@@ -22,44 +19,23 @@ EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 
 if not EMAIL_USER or not EMAIL_PASS:
-    raise RuntimeError(
-        "EMAIL_USER e EMAIL_PASS precisam estar configurados como variáveis "
-        "de ambiente (no dashboard do Render, em Environment)."
-    )
+    logger.warning("ATENÇÃO: EMAIL_USER ou EMAIL_PASS não estão configurados nas variáveis de ambiente!")
 
 CODIGO_VALIDADE_SEGUNDOS = 10 * 60
-LIMITE_PEDIDOS = 3
-JANELA_LIMITE_SEGUNDOS = 15 * 60
-
-# ---------------------------------------------------------------------------
-# Armazenamento em memória
-# ---------------------------------------------------------------------------
-codigos_gerados = {}   # email -> {"codigo": str, "expira_em": float}
-pedidos_por_email = {} # email -> [timestamps]
+codigos_gerados = {}
 
 
 def limpar_expirados():
     agora = time.time()
     for email in list(codigos_gerados.keys()):
-        if codigos_gerados[email]["expira_em"] < agora:
+        validos = [c for c in codigos_gerados[email] if c["expira_em"] > agora]
+        if validos:
+            codigos_gerados[email] = validos
+        else:
             del codigos_gerados[email]
 
 
-def excedeu_limite(email):
-    agora = time.time()
-    historico = pedidos_por_email.get(email, [])
-    historico = [t for t in historico if agora - t < JANELA_LIMITE_SEGUNDOS]
-    pedidos_por_email[email] = historico
-    return len(historico) >= LIMITE_PEDIDOS
-
-
-def registar_pedido(email):
-    pedidos_por_email.setdefault(email, []).append(time.time())
-
-
-# ---------------------------------------------------------------------------
-# Middleware CORS Adicional (Para garantir suporte total em file:// e Apps)
-# ---------------------------------------------------------------------------
+# Garantia de cabeçalhos CORS em TODAS as respostas (mesmo nos erros 500/400)
 @app.after_request
 def after_request(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -68,30 +44,42 @@ def after_request(response):
     return response
 
 
-# ---------------------------------------------------------------------------
-# Envio de e-mail
-# ---------------------------------------------------------------------------
-def enviar_email(destinatario, codigo):
-    msg = EmailMessage()
-    msg['Subject'] = f"{codigo} é o seu código Dimako"
-    msg['From'] = f"Dimako <{EMAIL_USER}>"
-    msg['To'] = destinatario
+# Tratador universal de exceções para nunca mascarar erros 500 no CORS
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logger.exception("Erro interno no servidor: %s", str(e))
+    response = jsonify({"sucesso": False, "erro": "Erro interno no servidor de e-mail."})
+    response.status_code = 500
+    return response
 
-    html = f"""
-    <div style="font-family:sans-serif; text-align:center; padding:32px 20px; background:#FFF8F3; border:1px solid #FFD9B3; border-radius:14px;">
-        <h2 style="color:#FF6B1A; margin:0 0 4px; letter-spacing:0.02em;">DIMAKO</h2>
-        <p style="color:#7A6F68; margin:0 0 20px;">O seu código de verificação é:</p>
-        <div style="display:inline-block; background:#FF6B1A; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:8px; padding:14px 24px; border-radius:10px;">
-            {codigo}
+
+def disparar_email_background(destinatario, codigo):
+    """Executa o envio via SMTP em segundo plano (Background Thread)."""
+    try:
+        msg = EmailMessage()
+        msg['Subject'] = f"{codigo} é o seu código Dimako"
+        msg['From'] = f"Dimako <{EMAIL_USER}>"
+        msg['To'] = destinatario
+
+        html = f"""
+        <div style="font-family:sans-serif; text-align:center; padding:32px 20px; background:#FFF8F3; border:1px solid #FFD9B3; border-radius:14px;">
+            <h2 style="color:#FF6B1A; margin:0 0 4px; letter-spacing:0.02em;">DIMAKO</h2>
+            <p style="color:#7A6F68; margin:0 0 20px;">O seu código de verificação é:</p>
+            <div style="display:inline-block; background:#FF6B1A; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:8px; padding:14px 24px; border-radius:10px;">
+                {codigo}
+            </div>
+            <p style="font-size:12px; color:#B0A69F; margin-top:24px;">Este código é válido por 10 minutos.</p>
         </div>
-        <p style="font-size:12px; color:#B0A69F; margin-top:24px;">Se não solicitou este código, ignore este e-mail.</p>
-    </div>
-    """
-    msg.add_alternative(html, subtype='html')
+        """
+        msg.add_alternative(html, subtype='html')
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(EMAIL_USER, EMAIL_PASS)
-        smtp.send_message(msg)
+        # Timeout curto de 8 segundos na conexão SMTP para não travar
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=8) as smtp:
+            smtp.login(EMAIL_USER, EMAIL_PASS)
+            smtp.send_message(msg)
+        logger.info("E-mail enviado com sucesso para %s", destinatario)
+    except Exception as e:
+        logger.exception("Erro ao enviar e-mail em segundo plano para %s: %s", destinatario, str(e))
 
 
 def gerar_codigo():
@@ -99,8 +87,9 @@ def gerar_codigo():
 
 
 # ---------------------------------------------------------------------------
-# Rotas
+# ROTAS
 # ---------------------------------------------------------------------------
+
 @app.route('/enviar-codigo', methods=['POST', 'OPTIONS'])
 def rota_enviar():
     if request.method == 'OPTIONS':
@@ -112,30 +101,26 @@ def rota_enviar():
     email = str(dados.get('email', '')).strip().lower()
 
     if not email or '@' not in email or '.' not in email:
-        return jsonify({"sucesso": False, "erro": "Email inválido"}), 400
+        return jsonify({"sucesso": False, "erro": "E-mail inválido"}), 400
 
-    if excedeu_limite(email):
-        return jsonify({
-            "sucesso": False,
-            "erro": "Muitos pedidos para este e-mail. Tente novamente mais tarde."
-        }), 429
+    if not EMAIL_USER or not EMAIL_PASS:
+        return jsonify({"sucesso": False, "erro": "Servidor de e-mail não configurado (EMAIL_USER/EMAIL_PASS)."}), 500
 
     codigo = gerar_codigo()
-    codigos_gerados[email] = {
+    novo_registro = {
         "codigo": codigo,
-        "expira_em": time.time() + CODIGO_VALIDADE_SEGUNDOS,
+        "expira_em": time.time() + CODIGO_VALIDADE_SEGUNDOS
     }
-    registar_pedido(email)
 
-    try:
-        enviar_email(email, codigo)
-    except Exception:
-        logger.exception("Falha ao enviar e-mail para %s", email)
-        if email in codigos_gerados:
-            del codigos_gerados[email]
-        return jsonify({"sucesso": False, "erro": "Não foi possível enviar o e-mail. Tente novamente."}), 500
+    codigos_gerados.setdefault(email, []).append(novo_registro)
 
-    return jsonify({"sucesso": True})
+    # Inicia a Thread para enviar o e-mail em segundo plano de forma hiper-rápida
+    thread = threading.Thread(target=disparar_email_background, args=(email, codigo))
+    thread.daemon = True
+    thread.start()
+
+    # Retorna resposta imediata para o usuário (em milissegundos)
+    return jsonify({"sucesso": True, "mensagem": "Código enviado! Válido por 10 minutos."})
 
 
 @app.route('/verificar-codigo', methods=['POST', 'OPTIONS'])
@@ -150,27 +135,27 @@ def rota_verificar():
     codigo_digitado = str(dados.get('codigo', '')).strip()
 
     if not email or not codigo_digitado:
-        return jsonify({"validado": False, "erro": "Email ou código não fornecido"}), 400
+        return jsonify({"validado": False, "erro": "E-mail ou código não fornecido"}), 400
 
-    registo = codigos_gerados.get(email)
+    lista_codigos = codigos_gerados.get(email, [])
+    agora = time.time()
 
-    if not registo:
-        return jsonify({"validado": False, "erro": "Código incorreto ou expirado"}), 401
+    codigo_encontrado = None
+    for item in lista_codigos:
+        if item["expira_em"] > agora and secrets.compare_digest(item["codigo"], codigo_digitado):
+            codigo_encontrado = item
+            break
 
-    if registo["expira_em"] < time.time():
-        del codigos_gerados[email]
-        return jsonify({"validado": False, "erro": "Código expirado. Solicite um novo."}), 401
-
-    if not secrets.compare_digest(registo["codigo"], codigo_digitado):
-        return jsonify({"validado": False, "erro": "Código incorreto ou expirado"}), 401
-
-    del codigos_gerados[email]
-    return jsonify({"validado": True})
+    if codigo_encontrado:
+        lista_codigos.remove(codigo_encontrado)
+        return jsonify({"validado": True})
+    else:
+        return jsonify({"validado": False, "erro": "Código incorreto ou expirado."}), 401
 
 
 @app.route('/', methods=['GET', 'OPTIONS'])
 def health():
-    return jsonify({"api": "Dimako", "status": "running", "cors": "enabled_all"}), 200
+    return jsonify({"api": "Dimako", "status": "running"}), 200
 
 
 if __name__ == "__main__":
