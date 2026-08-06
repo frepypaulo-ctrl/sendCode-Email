@@ -3,13 +3,13 @@ import time
 import secrets
 import smtplib
 import logging
-import threading
 from email.message import EmailMessage
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-# Habilita CORS global
+
+# Libera CORS globalmente para qualquer origem (HTML local, sites ou Apps)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 logging.basicConfig(level=logging.INFO)
@@ -18,14 +18,15 @@ logger = logging.getLogger("dimako-api")
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 
-if not EMAIL_USER or not EMAIL_PASS:
-    logger.warning("ATENÇÃO: EMAIL_USER ou EMAIL_PASS não estão configurados nas variáveis de ambiente!")
-
+# Cada código individual é válido por 10 minutos (600 segundos)
 CODIGO_VALIDADE_SEGUNDOS = 10 * 60
+
+# Armazenamento em memória: email -> list de dicts [{"codigo": str, "expira_em": float}]
 codigos_gerados = {}
 
 
 def limpar_expirados():
+    """Remove apenas os códigos que já passaram de 10 minutos."""
     agora = time.time()
     for email in list(codigos_gerados.keys()):
         validos = [c for c in codigos_gerados[email] if c["expira_em"] > agora]
@@ -35,51 +36,37 @@ def limpar_expirados():
             del codigos_gerados[email]
 
 
-# Garantia de cabeçalhos CORS em TODAS as respostas (mesmo nos erros 500/400)
 @app.after_request
 def after_request(response):
+    """Garante cabeçalhos CORS em TODAS as respostas (mesmo em erros 400 ou 500)."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
     return response
 
 
-# Tratador universal de exceções para nunca mascarar erros 500 no CORS
-@app.errorhandler(Exception)
-def handle_exception(e):
-    logger.exception("Erro interno no servidor: %s", str(e))
-    response = jsonify({"sucesso": False, "erro": "Erro interno no servidor de e-mail."})
-    response.status_code = 500
-    return response
+def enviar_email(destinatario, codigo):
+    msg = EmailMessage()
+    msg['Subject'] = f"{codigo} é o seu código Dimako"
+    msg['From'] = f"Dimako <{EMAIL_USER}>"
+    msg['To'] = destinatario
 
-
-def disparar_email_background(destinatario, codigo):
-    """Executa o envio via SMTP em segundo plano (Background Thread)."""
-    try:
-        msg = EmailMessage()
-        msg['Subject'] = f"{codigo} é o seu código Dimako"
-        msg['From'] = f"Dimako <{EMAIL_USER}>"
-        msg['To'] = destinatario
-
-        html = f"""
-        <div style="font-family:sans-serif; text-align:center; padding:32px 20px; background:#FFF8F3; border:1px solid #FFD9B3; border-radius:14px;">
-            <h2 style="color:#FF6B1A; margin:0 0 4px; letter-spacing:0.02em;">DIMAKO</h2>
-            <p style="color:#7A6F68; margin:0 0 20px;">O seu código de verificação é:</p>
-            <div style="display:inline-block; background:#FF6B1A; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:8px; padding:14px 24px; border-radius:10px;">
-                {codigo}
-            </div>
-            <p style="font-size:12px; color:#B0A69F; margin-top:24px;">Este código é válido por 10 minutos.</p>
+    html = f"""
+    <div style="font-family:sans-serif; text-align:center; padding:32px 20px; background:#FFF8F3; border:1px solid #FFD9B3; border-radius:14px;">
+        <h2 style="color:#FF6B1A; margin:0 0 4px; letter-spacing:0.02em;">DIMAKO</h2>
+        <p style="color:#7A6F68; margin:0 0 20px;">O seu código de verificação é:</p>
+        <div style="display:inline-block; background:#FF6B1A; color:#ffffff; font-size:28px; font-weight:700; letter-spacing:8px; padding:14px 24px; border-radius:10px;">
+            {codigo}
         </div>
-        """
-        msg.add_alternative(html, subtype='html')
+        <p style="font-size:12px; color:#B0A69F; margin-top:24px;">Este código expira em 10 minutos.</p>
+    </div>
+    """
+    msg.add_alternative(html, subtype='html')
 
-        # Timeout curto de 8 segundos na conexão SMTP para não travar
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=8) as smtp:
-            smtp.login(EMAIL_USER, EMAIL_PASS)
-            smtp.send_message(msg)
-        logger.info("E-mail enviado com sucesso para %s", destinatario)
-    except Exception as e:
-        logger.exception("Erro ao enviar e-mail em segundo plano para %s: %s", destinatario, str(e))
+    # Conexão direta com timeout seguro de 12s
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=12) as smtp:
+        smtp.login(EMAIL_USER, EMAIL_PASS)
+        smtp.send_message(msg)
 
 
 def gerar_codigo():
@@ -104,7 +91,7 @@ def rota_enviar():
         return jsonify({"sucesso": False, "erro": "E-mail inválido"}), 400
 
     if not EMAIL_USER or not EMAIL_PASS:
-        return jsonify({"sucesso": False, "erro": "Servidor de e-mail não configurado (EMAIL_USER/EMAIL_PASS)."}), 500
+        return jsonify({"sucesso": False, "erro": "Variáveis EMAIL_USER/EMAIL_PASS não configuradas no Render"}), 500
 
     codigo = gerar_codigo()
     novo_registro = {
@@ -112,15 +99,28 @@ def rota_enviar():
         "expira_em": time.time() + CODIGO_VALIDADE_SEGUNDOS
     }
 
-    codigos_gerados.setdefault(email, []).append(novo_registro)
+    try:
+        # Envia o e-mail primeiro
+        enviar_email(email, codigo)
+        
+        # Guarda o código associado ao e-mail
+        codigos_gerados.setdefault(email, []).append(novo_registro)
+        
+        return jsonify({"sucesso": True, "mensagem": "Código enviado com sucesso!"}), 200
 
-    # Inicia a Thread para enviar o e-mail em segundo plano de forma hiper-rápida
-    thread = threading.Thread(target=disparar_email_background, args=(email, codigo))
-    thread.daemon = True
-    thread.start()
+    except smtplib.SMTPAuthenticationError:
+        logger.error("Erro de autenticação no SMTP do Gmail.")
+        return jsonify({
+            "sucesso": False, 
+            "erro": "Falha de login no servidor de e-mail (Verifique a Senha de Aplicação)."
+        }), 500
 
-    # Retorna resposta imediata para o usuário (em milissegundos)
-    return jsonify({"sucesso": True, "mensagem": "Código enviado! Válido por 10 minutos."})
+    except Exception as e:
+        logger.exception("Erro ao enviar e-mail: %s", str(e))
+        return jsonify({
+            "sucesso": False, 
+            "erro": f"Erro ao enviar e-mail: {str(e)}"
+        }), 500
 
 
 @app.route('/verificar-codigo', methods=['POST', 'OPTIONS'])
@@ -142,13 +142,15 @@ def rota_verificar():
 
     codigo_encontrado = None
     for item in lista_codigos:
+        # Compara com qualquer código válido não expirado
         if item["expira_em"] > agora and secrets.compare_digest(item["codigo"], codigo_digitado):
             codigo_encontrado = item
             break
 
     if codigo_encontrado:
+        # Consome o código validado para não ser reutilizado
         lista_codigos.remove(codigo_encontrado)
-        return jsonify({"validado": True})
+        return jsonify({"validado": True}), 200
     else:
         return jsonify({"validado": False, "erro": "Código incorreto ou expirado."}), 401
 
