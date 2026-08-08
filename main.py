@@ -3,14 +3,19 @@ import time
 import secrets
 import smtplib
 import logging
+import threading
 from email.message import EmailMessage
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 
-# Libera CORS globalmente para qualquer origem (HTML local, sites ou Apps)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# ---------------------------------------------------------------------------
+# CORS — ÚNICA fonte de verdade (não adicionar headers manualmente depois,
+# senão o browser recebe "Access-Control-Allow-Origin" duplicado e bloqueia
+# a resposta, mesmo o backend respondendo 200 OK).
+# ---------------------------------------------------------------------------
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dimako-api")
@@ -22,27 +27,22 @@ EMAIL_PASS = os.environ.get("EMAIL_PASS")
 CODIGO_VALIDADE_SEGUNDOS = 10 * 60
 
 # Armazenamento em memória: email -> list de dicts [{"codigo": str, "expira_em": float}]
+# Protegido por lock porque o Flask/gunicorn pode atender pedidos em threads
+# simultâneas dentro do mesmo worker.
 codigos_gerados = {}
+_lock = threading.Lock()
 
 
 def limpar_expirados():
     """Remove apenas os códigos que já passaram de 10 minutos."""
     agora = time.time()
-    for email in list(codigos_gerados.keys()):
-        validos = [c for c in codigos_gerados[email] if c["expira_em"] > agora]
-        if validos:
-            codigos_gerados[email] = validos
-        else:
-            del codigos_gerados[email]
-
-
-@app.after_request
-def after_request(response):
-    """Garante cabeçalhos CORS em TODAS as respostas (mesmo em erros 400 ou 500)."""
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
-    return response
+    with _lock:
+        for email in list(codigos_gerados.keys()):
+            validos = [c for c in codigos_gerados[email] if c["expira_em"] > agora]
+            if validos:
+                codigos_gerados[email] = validos
+            else:
+                del codigos_gerados[email]
 
 
 def enviar_email(destinatario, codigo):
@@ -77,11 +77,8 @@ def gerar_codigo():
 # ROTAS
 # ---------------------------------------------------------------------------
 
-@app.route('/enviar-codigo', methods=['POST', 'OPTIONS'])
+@app.route('/enviar-codigo', methods=['POST'])
 def rota_enviar():
-    if request.method == 'OPTIONS':
-        return jsonify({"status": "ok"}), 200
-
     limpar_expirados()
 
     dados = request.get_json(silent=True) or {}
@@ -102,32 +99,37 @@ def rota_enviar():
     try:
         # Envia o e-mail primeiro
         enviar_email(email, codigo)
-        
-        # Guarda o código associado ao e-mail
-        codigos_gerados.setdefault(email, []).append(novo_registro)
-        
+
+        # Guarda o código associado ao e-mail (protegido por lock)
+        with _lock:
+            codigos_gerados.setdefault(email, []).append(novo_registro)
+
         return jsonify({"sucesso": True, "mensagem": "Código enviado com sucesso!"}), 200
 
     except smtplib.SMTPAuthenticationError:
         logger.error("Erro de autenticação no SMTP do Gmail.")
         return jsonify({
-            "sucesso": False, 
+            "sucesso": False,
             "erro": "Falha de login no servidor de e-mail (Verifique a Senha de Aplicação)."
         }), 500
 
-    except Exception as e:
-        logger.exception("Erro ao enviar e-mail: %s", str(e))
+    except (smtplib.SMTPException, OSError, TimeoutError) as e:
+        logger.exception("Erro de conexão/SMTP ao enviar e-mail: %s", str(e))
         return jsonify({
-            "sucesso": False, 
-            "erro": f"Erro ao enviar e-mail: {str(e)}"
+            "sucesso": False,
+            "erro": f"Erro ao enviar e-mail (conexão/SMTP): {str(e)}"
+        }), 502
+
+    except Exception as e:
+        logger.exception("Erro inesperado ao enviar e-mail: %s", str(e))
+        return jsonify({
+            "sucesso": False,
+            "erro": f"Erro inesperado: {str(e)}"
         }), 500
 
 
-@app.route('/verificar-codigo', methods=['POST', 'OPTIONS'])
+@app.route('/verificar-codigo', methods=['POST'])
 def rota_verificar():
-    if request.method == 'OPTIONS':
-        return jsonify({"status": "ok"}), 200
-
     limpar_expirados()
 
     dados = request.get_json(silent=True) or {}
@@ -137,25 +139,27 @@ def rota_verificar():
     if not email or not codigo_digitado:
         return jsonify({"validado": False, "erro": "E-mail ou código não fornecido"}), 400
 
-    lista_codigos = codigos_gerados.get(email, [])
     agora = time.time()
-
     codigo_encontrado = None
-    for item in lista_codigos:
-        # Compara com qualquer código válido não expirado
-        if item["expira_em"] > agora and secrets.compare_digest(item["codigo"], codigo_digitado):
-            codigo_encontrado = item
-            break
+
+    with _lock:
+        lista_codigos = codigos_gerados.get(email, [])
+        for item in lista_codigos:
+            if item["expira_em"] > agora and secrets.compare_digest(item["codigo"], codigo_digitado):
+                codigo_encontrado = item
+                break
+
+        if codigo_encontrado:
+            # Consome o código validado para não ser reutilizado
+            lista_codigos.remove(codigo_encontrado)
 
     if codigo_encontrado:
-        # Consome o código validado para não ser reutilizado
-        lista_codigos.remove(codigo_encontrado)
         return jsonify({"validado": True}), 200
     else:
         return jsonify({"validado": False, "erro": "Código incorreto ou expirado."}), 401
 
 
-@app.route('/', methods=['GET', 'OPTIONS'])
+@app.route('/', methods=['GET'])
 def health():
     return jsonify({"api": "Dimako", "status": "running"}), 200
 
